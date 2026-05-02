@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+
+# Environment Variables
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Data & Databases
+lancedb/
+*.pdf
+*.db
+*.sqlite3
+
+# Specific Project Files
+N.S._SAVANNAH_UPDATED_FINAL_SAFETY_ANALYSIS_REPORT.pdf
+no-commit-docs/
+backup/
+data/*
+!data/.gitkeep

@@ -1,41 +1,64 @@
-"""
-Answer generation module for the RAG pipeline.
-Executes the full pipeline: Query -> Retrieve -> Rerank -> Generate.
+# conda activate x1025
+# python answer.py <lancedb/table_dir> "your question here"
+#
+# Self-contained one-shot test script for validating end-to-end RAG output.
+# (For repeated/interactive queries with a warm LLM, use chat.py instead.)
+#
+# Pipeline:
+#   1. retrieve()  → NV-Embed hybrid search + Qwen3-Reranker → top chunks
+#                    (runs in this process; uses cuda:0 + cuda:1)
+#   2. _generate() → spawns a child process with CUDA_VISIBLE_DEVICES pinned to
+#                    one MIG slice; child loads Qwen3.6-35B-A3B Q6_K via
+#                    llama-cpp-python and generates. Subprocess isolation is
+#                    required because llama.cpp dedupes devices by PCI BDF — all
+#                    MIG slices share one BDF, so single-slice pinning only works
+#                    when the slice is the only one visible to the process.
+#
+# Slice layout (each H200 MIG slice ~34.9 GB):
+#   cuda:0  — NV-Embed-v2           (~15.7 GB) [parent]
+#   cuda:1  — Qwen3-Reranker-8B     (~16.4 GB) [parent]
+#   slice 2 — Qwen3.6-35B-A3B Q6_K  (~28-30 GB) [child, single-slice]
+#
+# First run downloads the Q6_K GGUF (~29 GB) to HF_HOME (~5 min). Each subsequent
+# run reloads the model in the child (~2 min) — by design for a test script.
+#
+# Requirements:
+#   - 3+ MIG slices visible (--gres=gpu:3 minimum on Slurm)
+#   - llama-cpp-python built with CUDA support:
+#       CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir \
+#           --force-reinstall --no-binary=llama-cpp-python
+#
+# Override which MIG slice the LLM uses by setting LLM_MIG_UUID
+# (defaults to slice index 2 as listed by `nvidia-smi -L`).
+#
+# Importable:
+#   from answer import answer
+#   response = answer(Path("lancedb/my_table"), "your question")            # defaults: k=100, top_n=15
+#   response = answer(Path("lancedb/my_table"), "your question", k=200)     # widen candidate pool
+#   response = answer(Path("lancedb/my_table"), "your question", top_n=5)   # fewer chunks to LLM
 
-Usage:
-    python answer.py <path_to_lancedb_table> "your question here"
-
-Importable:
-    from answer import load_llm, answer
-    llm = load_llm()
-    print(answer(retriever, reranker, llm, "your question"))
-"""
-
+import argparse
+import multiprocessing as mp
 import os
-import sys
+import re
+import subprocess
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent.parent / ".env")
-os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
+load_dotenv(Path(__file__).parent / ".env")
+os.environ.setdefault("LANCE_LOG", "ERROR")
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from retrieve import retrieve
 
-from retrieve import init_retriever, init_reranker, retrieve_candidates, rerank_candidates
+__all__ = ["answer", "open_llm", "generate_with", "close_llm"]
 
-LLM_ID = "Qwen/Qwen3-30B-A3B"
-
-# Shard the model across available GPU devices based on free VRAM
-LLM_MAX_MEMORY = {0: "18GiB", 1: "10GiB", 2: "34GiB", 3: "34GiB"}
-
-LLM_MAX_NEW_TOKENS = 1024
-
-RETRIEVE_K  = 100   # hybrid candidates fetched before reranking
-RERANK_TOP  = 15    # chunks passed to the LLM as context
-
-SYSTEM_PROMPT = (
+_LLM_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"
+_LLM_FILE = "Qwen3.6-35B-A3B-UD-Q6_K.gguf"
+_LLM_CTX = 8192
+_LLM_MAX_NEW_TOKENS = 1024
+_LLM_SLICE_INDEX = 2
+_SYSTEM_PROMPT = (
     "You are a highly precise technical assistant.\n\n"
     "Rules:\n"
     "1. Use ONLY information explicitly stated in the provided context. Do not draw on outside knowledge.\n"
@@ -44,122 +67,110 @@ SYSTEM_PROMPT = (
     "4. If the context is insufficient to answer fully, state what is and is not available.\n"
     "5. Organize your final response in a clean, highly readable manner using ONLY plain text formatting (newlines and indentation). ABSOLUTELY DO NOT use Markdown formatting such as **, *, or #."
 )
+# Trailing <think>\n\n</think>\n\n disables Qwen3 thinking mode (same effect as enable_thinking=False)
+_PROMPT_TEMPLATE = (
+    "<|im_start|>system\n{system}<|im_end|>\n"
+    "<|im_start|>user\n{user}<|im_end|>\n"
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+)
 
+def _llm_mig_uuid() -> str:
+    if uuid := os.environ.get("LLM_MIG_UUID"):
+        return uuid
+    out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout
+    uuids = re.findall(r"UUID: (MIG-[a-f0-9-]+)", out)
+    if len(uuids) <= _LLM_SLICE_INDEX:
+        raise RuntimeError(f"Need at least {_LLM_SLICE_INDEX + 1} MIG slices, found {len(uuids)}")
+    return uuids[_LLM_SLICE_INDEX]
 
-def load_llm():
-    """
-    Load Qwen3-30B-A3B sharded across all 3 MIG slices using free VRAM.
-    Returns (model, tokenizer).
-    """
-    print(f"Loading {LLM_ID} (sharded across cuda:0/1/2/3) ...")
-    tok = AutoTokenizer.from_pretrained(LLM_ID, trust_remote_code=True)
-    mdl = AutoModelForCausalLM.from_pretrained(
-        LLM_ID,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        max_memory=LLM_MAX_MEMORY,
-    ).eval()
-    for i in range(4):
-        used = torch.cuda.memory_allocated(i) / 1e9
-        print(f"  cuda:{i} allocated: {used:.1f} GB")
-    return mdl, tok
+def _llm_worker(conn):
+    from llama_cpp import Llama
+    llm = Llama.from_pretrained(
+        repo_id=_LLM_REPO, filename=_LLM_FILE,
+        n_gpu_layers=-1, n_ctx=_LLM_CTX, verbose=False,
+    )
+    while True:
+        try:
+            prompt = conn.recv()
+        except EOFError:
+            break
+        if prompt is None:
+            break
+        output = llm(
+            prompt,
+            max_tokens=_LLM_MAX_NEW_TOKENS,
+            temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5,
+            stop=["<|im_end|>"],
+        )
+        conn.send(output["choices"][0]["text"])
 
-
-def _format_context(chunks: list[dict]) -> str:
+def _build_prompt(query: str, chunks: list) -> str:
     parts = []
     for i, c in enumerate(chunks, 1):
         header = f"[{i}] Section: {c['section']}"
         if c["chunk_type"] == "image":
             header += f"\n[Figure: {c['image_src']}] Description:"
         parts.append(f"{header}\n{c['text']}")
-    return "\n\n---\n\n".join(parts)
-
-
-def _build_messages(query: str, chunks: list[dict]) -> list[dict]:
-    context = _format_context(chunks)
+    context = "\n\n---\n\n".join(parts)
     user_content = (
-        f"Use the following passages from the technical document or report to answer the question.\n\n"
-        f"{context}\n\n"
-        f"Question: {query}"
+        "Use the following passages from the technical document or report to answer the question.\n\n"
+        f"{context}\n\nQuestion: {query}"
     )
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": user_content},
-    ]
+    return _PROMPT_TEMPLATE.format(system=_SYSTEM_PROMPT, user=user_content)
 
+def open_llm() -> tuple:
+    parent, child = mp.Pipe()
+    saved = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    os.environ["CUDA_VISIBLE_DEVICES"] = _llm_mig_uuid()
+    try:
+        p = mp.get_context("spawn").Process(target=_llm_worker, args=(child,))
+        p.start()
+    finally:
+        os.environ["CUDA_VISIBLE_DEVICES"] = saved
+    return (p, parent)
 
-def generate(llm, query: str, chunks: list[dict]) -> str:
-    """
-    Generate an answer from the LLM given a query and reranked context chunks.
-    Thinking mode is disabled (enable_thinking=False) for direct answers.
-    """
-    model, tokenizer = llm
-    messages = _build_messages(query, chunks)
-
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        enable_thinking=False,   # prepends <think></think> to skip reasoning phase
-        return_tensors="pt",
-    ).to(model.device)
-
-    attention_mask = torch.ones_like(input_ids)
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=LLM_MAX_NEW_TOKENS,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            top_k=None,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    # Decode only the newly generated tokens (strip the input)
-    new_tokens = output_ids[0][input_ids.shape[-1]:]
-    response = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    # Strip any residual <think>...</think> block the model may emit
-    if "<think>" in response:
-        end = response.find("</think>")
+def generate_with(session: tuple, query: str, chunks: list) -> str:
+    p, conn = session
+    conn.send(_build_prompt(query, chunks))
+    try:
+        text = conn.recv().strip()
+    except EOFError:
+        raise RuntimeError(f"LLM subprocess crashed (exit code {p.exitcode})")
+    if "<think>" in text:
+        end = text.find("</think>")
         if end != -1:
-            response = response[end + len("</think>"):].strip()
+            text = text[end + len("</think>"):].strip()
+    return text
 
-    return response
+def close_llm(session: tuple):
+    p, conn = session
+    try:
+        conn.send(None)
+    except (BrokenPipeError, OSError):
+        pass
+    p.join(timeout=5)
+    if p.is_alive():
+        p.terminate()
 
-
-def answer(retriever_tuple, reranker_tuple, llm, query: str) -> str:
-    """Run the full retrieve → rerank → generate pipeline for a query."""
-    embedder, table = retriever_tuple
-    candidates = retrieve_candidates(embedder, table, query, k=RETRIEVE_K)
-    chunks     = rerank_candidates(reranker_tuple, query, candidates, top_n=RERANK_TOP)
-    return generate(llm, query, chunks)
-
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python answer.py <lancedb/table_name> \"your question here\"")
-        sys.exit(1)
-
-    path_with_table = sys.argv[1]
-    query = " ".join(sys.argv[2:]).strip()
-
-    db_dir, table_name = path_with_table.rsplit("/", 1)
-    if table_name.endswith(".lance"):
-        table_name = table_name[:-6]
-    retriever_tuple = init_retriever(db_dir, table_name)
-    reranker_tuple  = init_reranker()
-    llm             = load_llm()
-
+def _print_answer(query: str, response: str):
     print(f"\nQuestion: {query}\n")
     print("=" * 60)
-    response = answer(retriever_tuple, reranker_tuple, llm, query)
     print(response)
     print("=" * 60)
 
+def answer(table_path: Path, query: str, k: int = 100, top_n: int = 15) -> str:
+    chunks = retrieve(table_path, query, k=k, top_n=top_n)
+    session = open_llm()
+    try:
+        response = generate_with(session, query, chunks)
+    finally:
+        close_llm(session)
+    _print_answer(query, response)
+    return response
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("table_path", type=Path, help="e.g. lancedb/my_table")
+    parser.add_argument("query", nargs="+", help="Query string")
+    args = parser.parse_args()
+    answer(args.table_path, " ".join(args.query))

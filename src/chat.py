@@ -1,80 +1,88 @@
-"""
-Interactive CLI module for the RAG pipeline.
-Allows users to select a manual and query the database using the hybrid retrieval and reranking pipeline.
-"""
+# conda activate x1025
+# python chat.py
+#
+# Interactive Q&A loop. Loads NV-Embed + Reranker (parent) and Qwen3.6-35B-A3B
+# Q6_K (child subprocess, single MIG slice) ONCE, then runs an input loop with
+# warm models. Same backend as answer.py — only the lifecycle differs.
+#
+# Commands inside the chat:
+#   switch  — pick a different manual (models stay loaded)
+#   quit    — exit (also: q, exit, Ctrl+D, Ctrl+C)
+
 import os
-import sys
 from pathlib import Path
-import lancedb
+
 from dotenv import load_dotenv
-from answer import load_llm, generate, RETRIEVE_K, RERANK_TOP
-from retrieve import init_retriever, init_reranker, retrieve_candidates, rerank_candidates
 
 load_dotenv(Path(__file__).parent.parent / ".env")
-os.environ.setdefault("HF_HOME", "/tmp/hf_cache")
+os.environ.setdefault("LANCE_LOG", "ERROR")
 
-def fetch_available_manual_names(database_directory_string):
-    database_path_object = Path(database_directory_string)
-    if not database_path_object.is_dir():
-        sys.exit(f"Error: {database_directory_string} directory not found.")
-    available_tables_list = [table_directory.name[:-6] for table_directory in database_path_object.iterdir() if table_directory.is_dir() and table_directory.name.endswith(".lance")]
-    if not available_tables_list:
-        sys.exit(f"Error: No tables found in {database_directory_string}.")
-    return sorted(available_tables_list)
+import sys
+from retrieve import open_retriever, retrieve_with, switch_table
+from answer import open_llm, generate_with, close_llm
 
-def prompt_user_for_manual_selection(available_manuals_list):
-    print("\n╔══════════════════════════════════════════════════════════╗\n║                   AVAILABLE MANUALS                      ║\n╚══════════════════════════════════════════════════════════╝")
-    for index_number, manual_name_string in enumerate(available_manuals_list, 1):
-        print(f"  {index_number}. {manual_name_string}")
-    
+__all__ = ["chat"]
+
+_DB_DIR = Path("data/lancedb")
+
+def _list_manuals() -> list:
+    if not _DB_DIR.is_dir():
+        sys.exit(f"Error: {_DB_DIR} not found.")
+    manuals = sorted(t.name[:-6] for t in _DB_DIR.iterdir() if t.is_dir() and t.name.endswith(".lance"))
+    if not manuals:
+        sys.exit(f"Error: No tables in {_DB_DIR}.")
+    return manuals
+
+def _pick_manual(manuals: list) -> str:
+    print("\nAvailable manuals:")
+    for i, name in enumerate(manuals, 1):
+        print(f"  {i}. {name}")
     while True:
         try:
-            user_input_string = input("\nSelect a manual by number (or 'q' to quit): ").strip()
-            if not user_input_string: continue
-            if user_input_string.lower() in {"exit", "quit", "q", ":q"}: sys.exit(0)
-            selected_index_integer = int(user_input_string) - 1
-            if 0 <= selected_index_integer < len(available_manuals_list): return available_manuals_list[selected_index_integer]
-            print(f"Invalid choice. Please enter a number between 1 and {len(available_manuals_list)}.")
-        except ValueError:
-            print("Please enter a valid number.")
+            choice = input(f"\nPick a manual (1-{len(manuals)}, or q to quit): ").strip()
         except (EOFError, KeyboardInterrupt):
-            sys.exit("\nGoodbye.")
+            sys.exit(0)
+        if choice.lower() in {"q", "quit", "exit"}:
+            sys.exit(0)
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(manuals):
+                return manuals[idx]
+        except ValueError:
+            pass
+        print(f"Invalid. Pick a number between 1 and {len(manuals)}.")
 
-def execute_chat_loop(vector_embedder_model, lancedb_database_directory_string, reranker_model_components, causal_language_model, available_manuals_list, initial_manual_name_string):
-    current_manual_name_string = initial_manual_name_string
-    current_database_connection = lancedb.connect(lancedb_database_directory_string).open_table(current_manual_name_string)
-    
-    while True:
-        display_manual_name_string = current_manual_name_string[:39] + "..." if len(current_manual_name_string) > 42 else current_manual_name_string
-        print(f"\n╔══════════════════════════════════════════════════════════╗\n║  Manual Q&A: {display_manual_name_string:<42}  ║\n║  Commands: exit / quit | 'switch' to change manual       ║\n╚══════════════════════════════════════════════════════════╝")
-        
+def chat():
+    manuals = _list_manuals()
+    table_name = _pick_manual(manuals)
+
+    print(f"\nLoading models for '{table_name}' (~3 min on first run)...")
+    retriever = open_retriever(_DB_DIR / f"{table_name}.lance")
+    llm = open_llm()
+    print("\nReady. Type a question. Commands: 'switch' / 'quit'.")
+
+    try:
         while True:
             try:
-                user_query_string = input("\n> ").strip()
+                query = input(f"\n[{table_name}] > ").strip()
             except (EOFError, KeyboardInterrupt):
-                sys.exit("\nGoodbye.")
-            if not user_query_string: continue
-            if user_query_string.lower() in {"exit", "quit", "q", ":q"}: sys.exit("Goodbye.")
-            if user_query_string.lower() == "switch":
-                current_manual_name_string = prompt_user_for_manual_selection(available_manuals_list)
-                current_database_connection = lancedb.connect(lancedb_database_directory_string).open_table(current_manual_name_string)
                 break
+            if not query:
+                continue
+            if query.lower() in {"q", "quit", "exit"}:
+                break
+            if query.lower() == "switch":
+                table_name = _pick_manual(manuals)
+                retriever = switch_table(retriever, _DB_DIR / f"{table_name}.lance")
+                continue
 
-            print("  Searching...", flush=True)
-            initial_retrieved_passages = retrieve_candidates(vector_embedder_model, current_database_connection, user_query_string, k=RETRIEVE_K)
-            print("  Reranking...", flush=True)
-            final_reranked_passages = rerank_candidates(reranker_model_components, user_query_string, initial_retrieved_passages, top_n=RERANK_TOP)
+            print("  Retrieving + reranking...", flush=True)
+            chunks = retrieve_with(retriever, query, 50, 5)
             print("  Generating...\n", flush=True)
-            print(generate(causal_language_model, user_query_string, final_reranked_passages))
+            print(generate_with(llm, query, chunks))
+    finally:
+        close_llm(llm)
+        print("\nGoodbye.")
 
 if __name__ == "__main__":
-    lancedb_database_directory_string = "lancedb"
-    available_manuals_list = fetch_available_manual_names(lancedb_database_directory_string)
-    selected_manual_name_string = prompt_user_for_manual_selection(available_manuals_list)
-    
-    print(f"\nLoading models and connecting to '{selected_manual_name_string}'...")
-    dense_vector_embedder_model, _ = init_retriever(lancedb_database_directory_string, selected_manual_name_string)
-    cross_encoder_reranker_model_components = init_reranker()
-    qwen_causal_language_model_components = load_llm()
-    
-    execute_chat_loop(dense_vector_embedder_model, lancedb_database_directory_string, cross_encoder_reranker_model_components, qwen_causal_language_model_components, available_manuals_list, selected_manual_name_string)
+    chat()
